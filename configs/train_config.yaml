@@ -1,0 +1,174 @@
+# ============================================================
+# CodeGuide-LLM 训练配置
+# Backbone: Qwen2.5-Coder-7B-Instruct
+# 硬件目标: 单卡 RTX 4090 (24 GB VRAM)
+# ============================================================
+
+# ── 模型 ────────────────────────────────────────────────────
+model:
+  name: "Qwen/Qwen2.5-Coder-7B-Instruct"
+  # 本地缓存路径（可选，留空则从 HF Hub 自动下载）
+  local_path: ""
+  max_seq_length: 4096
+  # 使用 unsloth 的快速加载
+  use_unsloth: true
+
+# ── QLoRA / 量化 ────────────────────────────────────────────
+qlora:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"           # NF4 量化（比 fp4 更准确）
+  bnb_4bit_compute_dtype: "bfloat16"   # 计算时反量化为 bf16
+  bnb_4bit_use_double_quant: true      # 双重量化，进一步压缩显存
+
+# ── LoRA ────────────────────────────────────────────────────
+lora:
+  r: 64                    # LoRA rank，越大表达能力越强但显存占用也更大
+  lora_alpha: 128          # 缩放系数，通常设为 2*r
+  lora_dropout: 0.05
+  bias: "none"
+  task_type: "CAUSAL_LM"
+  # 作用于 Qwen2.5 的注意力 + MLP 投影层
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+
+# ── GRPO 后训练超参数 ────────────────────────────────────────
+grpo:
+  # ── 模型加载 ──────────────────────────────────────────────
+  # 从 SFT adapter 热启动（留空则从 base model 冷启动）
+  sft_adapter_path: "models/sft_adapter"
+  max_seq_length: 2048           # prompt + generation 总长度上限
+  max_prompt_length: 1024        # prompt 最大长度（超出则截断）
+
+  # ── GRPOConfig 核心参数 ────────────────────────────────────
+  num_generations: 4             # 每个 prompt 采样 4 个 response（Group size）
+  max_new_tokens: 1024           # 最大生成 token 数（步进式讲解需要长输出）
+  temperature: 0.8               # 采样温度（比 SFT 阶段略高，增加探索性）
+  top_p: 0.95
+  kl_coef: 0.05                  # KL 散度系数，防止策略偏离 SFT 参考模型
+                                 # 注：TRL 参数名为 kl_coef（非 kl_coeff）
+
+  # ── 优化器 ────────────────────────────────────────────────
+  learning_rate: 1.0e-5          # 比 SFT 低一个数量级（RL 阶段更保守）
+  per_device_train_batch_size: 1 # 显存有限；有效 batch = 1×8×4gen = 32 rollouts
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # ── 精度 & 显存 ───────────────────────────────────────────
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+
+  # ── 日志 & 保存 ───────────────────────────────────────────
+  logging_steps: 50
+  save_steps: 100
+  seed: 42
+
+  # ── 路径 ──────────────────────────────────────────────────
+  train_data: "data/sft_train.jsonl"
+  output_dir: "models/grpo_final"          # LoRA adapter 存放位置
+  merged_dir: "models/codeguide_llm_merged" # 合并后完整模型
+  logging_dir: "logs/grpo"
+
+# ── 奖励函数权重 ────────────────────────────────────────────
+reward:
+  # ── scripts/train_grpo.py 使用的简化奖励（本地，无 API 调用）──
+  # combined_reward = alpha * accuracy + (1-alpha) * format
+  alpha: 0.6                     # accuracy_reward 权重
+  exec_timeout: 5.0              # 沙箱执行超时（秒）
+
+  # ── src/reward/composite.py 使用的三路复合奖励 ──────────────
+  # 三个权重之和应为 1.0
+  teaching_completeness: 0.4    # TeachingCompletenessReward（LLM-as-Judge）
+  code_correctness:      0.4    # CodeCorrectnessReward（本地沙箱执行）
+  format_compliance:     0.2    # FormatComplianceReward（规则打分）
+
+  # LLM-as-Judge 配置（TeachingCompletenessReward 使用）
+  judge_model: "gpt-4o-mini"    # 使用 mini 版降低延迟与成本
+  judge_temperature: 0.0        # 评分任务使用确定性输出
+
+# ── 优化器 ──────────────────────────────────────────────────
+optimizer:
+  type: "adamw_8bit"             # bitsandbytes 8-bit AdamW，节省显存
+  learning_rate: 5.0e-6
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+
+# ── 训练流程 ────────────────────────────────────────────────
+training:
+  num_train_epochs: 3
+  max_steps: -1                  # -1 表示以 epoch 为准；设正整数则覆盖 epoch
+  save_strategy: "steps"
+  save_steps: 200
+  eval_strategy: "steps"
+  eval_steps: 200
+  logging_steps: 10
+  fp16: false
+  bf16: true                     # 4090 Ampere 架构原生支持 bf16
+  gradient_checkpointing: true   # 用时间换显存
+  dataloader_num_workers: 4
+  seed: 42
+
+# ── 路径 ────────────────────────────────────────────────────
+paths:
+  train_data: "data/processed/train.jsonl"
+  eval_data: "data/processed/eval.jsonl"
+  output_dir: "models/checkpoints"
+  final_model_dir: "models/final/codeguide-7b"
+  logging_dir: "logs/grpo"
+
+# ── SFT 专属配置（与 GRPO 配置独立，互不影响）────────────────
+sft:
+  # LoRA（SFT 阶段用较小的 rank，收敛快、不易过拟合）
+  lora_r: 16
+  lora_alpha: 32          # 通常设为 2 * r
+  lora_dropout: 0.05
+
+  # 训练超参
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4  # 有效 batch = 2 * 4 = 8
+  max_seq_length: 2048
+  num_train_epochs: 3
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+
+  # 日志 & 保存
+  logging_steps: 50       # 每 50 step 打印 loss
+  save_steps: 200
+  eval_steps: 200
+  eval_split_ratio: 0.05  # 从 sft_train.jsonl 中切 5% 做验证集
+
+  # 显存优化
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  dataloader_num_workers: 2
+  seed: 42
+
+  # 路径
+  train_data: "data/sft_train.jsonl"
+  output_dir: "models/sft_checkpoints"
+  adapter_dir: "models/sft_adapter"
+  logging_dir: "logs/sft"
+
+# ── Weights & Biases ────────────────────────────────────────
+wandb:
+  project: "codeguide-llm"
+  run_name: "grpo-qwen2.5-coder-7b"
+  tags: ["grpo", "qlora", "qwen2.5", "oi-teaching"]
+
+  # SFT run（由 train_sft.py 单独覆盖）
+  sft_run_name: "sft-qwen2.5-coder-7b"
+  sft_tags: ["sft", "qlora", "qwen2.5", "oi-teaching"]

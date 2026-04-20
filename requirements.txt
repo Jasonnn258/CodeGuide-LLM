@@ -1,0 +1,44 @@
+# ============================================================
+# CodeGuide-LLM 依赖
+# 环境：Python 3.11 + CUDA 12.1 + RTX 4090 (24GB)
+# ============================================================
+
+# --- 训练框架 ---
+# unsloth: QLoRA 高效训练，支持 Qwen2.5，4090 单卡约 2x 加速
+# 安装前请先按 https://github.com/unslothai/unsloth 确认 CUDA 版本
+unsloth[cu121-ampere-torch240]>=2024.12.0
+
+# trl: 包含 GRPOTrainer、SFTTrainer
+trl>=0.12.0
+
+# Hugging Face 核心生态
+transformers>=4.47.0
+datasets>=3.0.0
+peft>=0.14.0
+accelerate>=1.1.0
+
+# --- 量化 ---
+bitsandbytes>=0.45.0       # NF4/FP4 QLoRA 量化后端
+
+# --- 推理加速 ---
+flash-attn>=2.7.0           # FlashAttention-2，需与 CUDA 版本匹配
+einops>=0.8.0
+
+# --- 评测 & 蒸馏 ---
+openai>=1.55.0              # GPT-4o 蒸馏 + LLM-as-Judge 评测
+
+# --- 实验追踪 ---
+wandb>=0.18.0
+
+# --- 数据处理 ---
+numpy>=1.26.0
+pandas>=2.2.0
+tqdm>=4.66.0
+jsonlines>=4.0.0
+
+# --- 代码执行（在线 judge 奖励） ---
+pytest>=8.0.0
+
+# --- 其他工具 ---
+rich>=13.9.0                # 美化终端输出
+omegaconf>=2.3.0            # YAML 配置读取
