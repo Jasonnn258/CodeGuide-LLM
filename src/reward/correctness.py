@@ -1,6 +1,10 @@
 """
 CodeCorrectnessReward: 提取模型输出中的代码块，在沙箱中运行测试用例
 返回 pass 率作为奖励 [0.0, 1.0]
+
+改进（v2）：
+- 无测试用例时改为调用 _estimate_code_quality 做静态分析
+  而非固定返回 0.5，保持与 reward_functions.accuracy_reward 一致
 """
 import re
 import subprocess
@@ -9,6 +13,8 @@ import textwrap
 from typing import List, Optional
 
 from omegaconf import DictConfig
+
+from src.reward_functions import _estimate_code_quality
 
 _CODE_BLOCK_RE = re.compile(r"```(?:python)?\n(.*?)```", re.DOTALL)
 
@@ -22,7 +28,9 @@ def _extract_code(text: str) -> Optional[str]:
 def _run_tests(code: str, test_cases: List[dict], timeout: int = 5) -> float:
     """在子进程中运行测试用例，返回通过率"""
     if not test_cases:
-        return 0.5  # 无测试用例时给中性分
+        # 原实现：固定返回 0.5（中性分），无法区分代码质量好坏。
+        # 改为：静态分析估分，保留梯度信号。
+        return _estimate_code_quality(code)
 
     passed = 0
     for tc in test_cases:

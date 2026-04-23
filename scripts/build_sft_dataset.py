@@ -49,6 +49,7 @@ from tqdm.asyncio import tqdm as async_tqdm
 
 from src.data.code_validator import validate
 from src.data.loader import Problem, load_problems
+from src.data.quality import DataQualityChecker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,30 +122,74 @@ async def call_gpt4o_async(
     client: AsyncOpenAI,
     problem: Problem,
     semaphore: asyncio.Semaphore,
+    quality_checker: "DataQualityChecker",
     retry: int = 3,
+    max_tokens: int = 3072,
 ) -> Optional[str]:
-    """异步调用 GPT-4o，semaphore 限制并发，失败时指数退避重试。"""
+    """
+    异步调用 GPT-4o，semaphore 限制并发，失败时指数退避重试。
+
+    改进（v2）：
+    - max_tokens 从 2048 提升到 3072，减少长题目的截断概率
+    - 检测 finish_reason == "length" 时自动重试（截断重试）
+    - 对返回内容进行质量检测，分数 < 0.6 视为低质量，触发重试
+    - 重试时提示词末尾加"请确保完整输出代码块"，引导模型补全
+    """
     tags_str = ", ".join(problem.tags) if problem.tags else "暂无"
     user_content = USER_TMPL.format(
         description=problem.description,
         difficulty=problem.difficulty,
         tags=tags_str,
     )
-    messages = [
+    base_messages = [
         {"role": "system", "content": SFT_SYSTEM_PROMPT},
         {"role": "user",   "content": user_content},
     ]
 
     async with semaphore:
         for attempt in range(retry):
+            # 截断重试时在用户消息末尾追加补充指令
+            if attempt > 0:
+                retry_suffix = "\n\n【重要】请确保输出完整的代码块（```python ... ```），不要中途截断。"
+                messages = [
+                    base_messages[0],
+                    {"role": "user", "content": user_content + retry_suffix},
+                ]
+            else:
+                messages = base_messages
+
             try:
                 resp = await client.chat.completions.create(
                     model="gpt-4o",
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=2048,
+                    max_tokens=max_tokens,
                 )
-                return resp.choices[0].message.content
+                choice = resp.choices[0]
+                content = choice.message.content or ""
+
+                # 检测截断（finish_reason == "length"）
+                if choice.finish_reason == "length":
+                    logger.warning(
+                        "[%s] 触发 max_tokens 截断（attempt %d/%d），重试…",
+                        problem.id, attempt + 1, retry,
+                    )
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                # 质量过滤
+                quality_score = quality_checker.score(content)
+                if quality_score < quality_checker.threshold:
+                    logger.warning(
+                        "[%s] 质量分 %.2f < %.2f（attempt %d/%d），重试…",
+                        problem.id, quality_score, quality_checker.threshold,
+                        attempt + 1, retry,
+                    )
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                return content
+
             except Exception as e:
                 wait = 2 ** attempt
                 logger.warning(
@@ -202,6 +247,7 @@ class Counter:
         self.total = 0
         self.skipped = 0
         self.gpt_failed = 0
+        self.low_quality = 0   # 新增：质量过滤丢弃数
         self.no_code = 0
         self.syntax_fail = 0
         self.exec_fail = 0
@@ -212,6 +258,7 @@ class Counter:
             f"总计处理: {self.total}\n"
             f"  ├ 断点跳过:   {self.skipped}\n"
             f"  ├ GPT-4o失败: {self.gpt_failed}\n"
+            f"  ├ 质量过滤:   {self.low_quality}\n"
             f"  ├ 无代码块:   {self.no_code}\n"
             f"  ├ 语法错误:   {self.syntax_fail}\n"
             f"  ├ 执行失败:   {self.exec_fail}\n"
@@ -225,6 +272,7 @@ async def process_one(
     client: AsyncOpenAI,
     problem: Problem,
     semaphore: asyncio.Semaphore,
+    quality_checker: DataQualityChecker,
     run_code: bool,
     counter: Counter,
     out_file,
@@ -232,8 +280,8 @@ async def process_one(
 ) -> None:
     counter.total += 1
 
-    # GPT-4o 标注
-    cot = await call_gpt4o_async(client, problem, semaphore)
+    # GPT-4o 标注（含截断重试 + 质量过滤）
+    cot = await call_gpt4o_async(client, problem, semaphore, quality_checker)
     if cot is None:
         counter.gpt_failed += 1
         return
@@ -303,10 +351,14 @@ async def async_main(args: argparse.Namespace) -> None:
     lock = asyncio.Lock()
     counter = Counter()
     counter.skipped = len(done_ids)
+    quality_checker = DataQualityChecker(threshold=args.quality_threshold)
+    logger.info("质量过滤阈值：%.2f（低于此分数的样本触发重试或丢弃）",
+                args.quality_threshold)
 
     with open(out_path, "a", encoding="utf-8") as out_file:
         tasks = [
-            process_one(client, p, semaphore, args.run_code, counter, out_file, lock)
+            process_one(client, p, semaphore, quality_checker,
+                        args.run_code, counter, out_file, lock)
             for p in pending
         ]
         # tqdm 进度条
@@ -328,6 +380,8 @@ def main() -> None:
                         help="并发 GPT-4o 请求数（建议 5-20，避免触发限速）")
     parser.add_argument("--run_code",    action="store_true",
                         help="启用沙箱执行校验（有测试用例时），会过滤执行错误样本")
+    parser.add_argument("--quality_threshold", type=float, default=0.6,
+                        help="蒸馏数据质量过滤阈值 [0,1]（默认 0.6，低于此值触发重试/丢弃）")
     args = parser.parse_args()
 
     asyncio.run(async_main(args))

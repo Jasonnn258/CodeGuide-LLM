@@ -75,9 +75,26 @@ grpo:
 
   # ── 路径 ──────────────────────────────────────────────────
   train_data: "data/sft_train.jsonl"
-  output_dir: "models/grpo_final"          # LoRA adapter 存放位置
+  output_dir: "models/grpo_final"           # LoRA adapter 存放位置
   merged_dir: "models/codeguide_llm_merged" # 合并后完整模型
   logging_dir: "logs/grpo"
+  best_model_dir: "models/grpo_best"        # 验证集 Pass@1 最优 checkpoint
+
+  # ── Reward 归一化（改动 7）──────────────────────────────────
+  # true：对每个 batch 内的 combined reward 做 z-score 归一化
+  # 解决三路 reward 方差不一致导致高方差路径隐式主导梯度的问题
+  normalize_rewards: true
+
+  # ── Generation Collapse 检测（改动 8）───────────────────────
+  # 组内 reward 方差低于此阈值视为该 prompt 发生坍缩
+  collapse_var_threshold: 0.01
+  # 连续多少步 collapse_ratio > 0.5 时发出 WARNING
+  collapse_warn_steps: 20
+
+  # ── 最优 Checkpoint 选择（改动 9）───────────────────────────
+  # true：启用 BestCheckpointCallback，每 eval_steps 步评估验证集 Pass@1
+  save_best: true
+  eval_steps: 100                           # 每隔多少步做一次验证集评估
 
 # ── 奖励函数权重 ────────────────────────────────────────────
 reward:
@@ -92,7 +109,12 @@ reward:
   code_correctness:      0.4    # CodeCorrectnessReward（本地沙箱执行）
   format_compliance:     0.2    # FormatComplianceReward（规则打分）
 
-  # LLM-as-Judge 配置（TeachingCompletenessReward 使用）
+  # Teaching Reward 模式（local 为默认，api 为可选基线）
+  # local: 无 API 调用，启发式连续评分，~1ms/样本，训练推荐
+  # api:   调用 GPT-4o-mini，离散评分，用于离线评估 / ablation 对比
+  teaching_mode: "local"
+
+  # LLM-as-Judge 配置（teaching_mode: api 时生效）
   judge_model: "gpt-4o-mini"    # 使用 mini 版降低延迟与成本
   judge_temperature: 0.0        # 评分任务使用确定性输出
 
@@ -172,3 +194,20 @@ wandb:
   # SFT run（由 train_sft.py 单独覆盖）
   sft_run_name: "sft-qwen2.5-coder-7b"
   sft_tags: ["sft", "qlora", "qwen2.5", "oi-teaching"]
+
+# ── Curriculum Learning（改动 12）───────────────────────────
+# 按难度分阶段训练（easy → medium → hard），解决早期难题导致梯度消失的问题。
+# 设计动机：GRPO 早期直接遇到 hard 题，Pass@1≈0，reward≈0，梯度消失。
+# 分阶段后，easy 阶段结束时 Pass@1 从 0 提升到 ~0.3，模型有了基础能力。
+curriculum:
+  enabled: false                           # 默认关闭；设为 true 启用课程学习
+  stages:
+    - difficulty: "easy"
+      epochs: 1
+      max_new_tokens: 512                  # 简单题输出较短，节省显存
+    - difficulty: "medium"
+      epochs: 1
+      max_new_tokens: 768
+    - difficulty: "hard"
+      epochs: 1
+      max_new_tokens: 1024                 # 难题需要更长的推理链

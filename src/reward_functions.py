@@ -127,7 +127,74 @@ def _scan_security(code: str) -> list[str]:
 
 
 # ════════════════════════════════════════════════════════════════
-# 2. accuracy_reward
+# 2. 静态代码质量估算（无测试用例时的代理信号）
+# ════════════════════════════════════════════════════════════════
+
+def _estimate_code_quality(code: str) -> float:
+    """
+    当题目没有 public_tests 时，用 AST 静态分析估计代码质量。
+
+    设计动机：
+    - 原实现：无测试直接 return 1.0，约 40% 的 TACO 样本受影响，
+      导致模型学会输出"能过安全扫描的任意代码"即可得满分。
+    - 改为：用 5 个维度打分，返回 [0, 1] 的连续分数，保留梯度信号。
+
+    评分维度（满分 1.0）：
+      +0.30  AST 解析成功（语法正确）
+      +0.20  至少定义了一个函数（有逻辑结构，非单纯脚本）
+      +0.20  有注释行（体现教学要求的可读性）
+      +0.20  代码行数在合理范围 [10, 100]（太短=不完整，太长=乱填充）
+      +0.10  无空实现（no `pass` as sole function body）
+
+    注意：此函数只在无测试用例时调用，有测试用例时仍走沙箱执行。
+    """
+    score = 0.0
+
+    # 维度 1：语法合法性（AST 解析成功）
+    try:
+        tree = ast.parse(code)
+        score += 0.30
+    except SyntaxError:
+        return 0.0  # 语法错误直接 0 分，无需继续
+
+    # 维度 2：至少有一个函数定义
+    has_func = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   for node in ast.walk(tree))
+    if has_func:
+        score += 0.20
+
+    # 维度 3：有注释行（# 开头的行或 docstring）
+    lines = code.splitlines()
+    comment_lines = sum(1 for l in lines if l.strip().startswith("#"))
+    has_docstring = any(
+        isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+        for node in ast.walk(tree)
+    )
+    if comment_lines >= 2 or has_docstring:
+        score += 0.20
+
+    # 维度 4：代码行数合理（10~100 行）
+    non_empty_lines = sum(1 for l in lines if l.strip())
+    if 10 <= non_empty_lines <= 100:
+        score += 0.20
+
+    # 维度 5：无空 pass 实现（函数体不能只有 pass）
+    has_pass_only = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if len(body) == 1 and isinstance(body[0], ast.Pass):
+                has_pass_only = True
+                break
+    if not has_pass_only:
+        score += 0.10
+
+    return round(min(score, 1.0), 4)
+
+
+# ════════════════════════════════════════════════════════════════
+# 3. accuracy_reward
 # ════════════════════════════════════════════════════════════════
 
 _SENTINEL = "__CODEGUIDE_PASS__"   # 用于标记单条测试通过的哨兵串
@@ -192,10 +259,12 @@ def accuracy_reward(
     if violations:
         return 0.0
 
-    # ── Step 2: 无测试用例时只做语法验证 ─────────────────────
+    # ── Step 2: 无测试用例时用静态分析估分 ──────────────────────
+    # 原实现：无测试直接给 1.0，导致 reward hacking（模型只需输出
+    # 能通过安全扫描的任意代码即可得满分，约 40% TACO 题受影响）。
+    # 改为：使用 AST 静态质量分析作为代理信号，强制保留梯度。
     if not test_cases:
-        # 能通过安全扫描（已含语法解析）即给满分
-        return 1.0
+        return _estimate_code_quality(solution_code)
 
     # ── Step 3: 沙箱执行 ─────────────────────────────────────
     harness = _build_exec_harness(solution_code, test_cases)

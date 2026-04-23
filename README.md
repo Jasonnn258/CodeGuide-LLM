@@ -8,287 +8,299 @@ OI/ACM 初学者的核心痛点不是缺少题解代码，而是缺少**逐步�
 
 CodeGuide-LLM 的目标是：通过 **GRPO 强化学习 + QLoRA 参数高效微调**，使开源代码模型具备"步进式算法教学"能力——像一位有耐心的 OI 教练，先分析题意，再引导思路，最后才给出代码。
 
+本项目在标准 GRPO 训练流程的基础上，针对实际训练中发现的 **12 项具体问题**进行了有针对性的迭代改进，形成了一套更鲁棒的强化学习教学微调方案。
+
+---
+
 ## 技术路线
 
 ```
-原始数据 (LeetCode / Codeforces)
+原始题目（deepmind/code_contests + BAAI/TACO）
         │
         ▼
-GPT-4o 蒸馏生成"步进式讲解"数据
+GPT-4o 蒸馏 → 步进式讲解数据（DataQualityChecker 过滤低质量样本）
         │
         ▼
-监督微调 SFT（warm-start，可选）
+监督微调 SFT（Qwen2.5-Coder-7B-Instruct + QLoRA，warm-start）
         │
         ▼
 GRPO 强化学习微调
-  ├── Reward Model 1: 讲解步骤完整性（LLM-as-Judge）
-  ├── Reward Model 2: 最终代码正确性（在线判题）
-  └── Reward Model 3: 教学格式规范（规则打分）
+  ├── Reward 1: 代码正确性（本地沙箱执行 / AST 静态分析）
+  ├── Reward 2: 讲解格式规范（内容感知连续评分，防 hacking）
+  ├── Reward 3: 教学质量（LocalTeachingReward，毫秒级启发式）
+  └── Batch 内 Z-score 归一化 + Generation Collapse 检测
         │
         ▼
-Qwen2.5-Coder-7B-Instruct（QLoRA NF4，单卡 4090）
+最优 Checkpoint 选择（验证集 Pass@1，非最后一个 epoch）
         │
         ▼
-评测：教学质量 / Pass@k / 用户满意度
+双盲评测（GPT-4o Judge，3 维度 + Bootstrap 95% CI + 显著性检验）
 ```
 
-## Backbone 选型：Qwen2.5-Coder-7B-Instruct
+---
+
+## Backbone：Qwen2.5-Coder-7B-Instruct
 
 | 维度 | 理由 |
 |------|------|
-| 代码能力 | HumanEval 88.4%，EvoEval、LiveCodeBench 均优于同参数规模竞品 |
+| 代码能力 | HumanEval 88.4%，EvoEval / LiveCodeBench 均优于同参数竞品 |
 | 中文友好 | 原生中英双语预训练，讲解中文无需额外对齐 |
-| Unsloth 兼容 | unsloth 官方支持 Qwen2.5 系列，可获 2x 训练加速 |
-| 单卡可训 | 7B + NF4 QLoRA：显存占用约 10-12 GB，4090 (24 GB) 绰绰有余 |
+| Unsloth 兼容 | 官方支持 Qwen2.5 系列，2× 训练加速 |
+| 单卡可训 | 7B + NF4 QLoRA：约 10-12 GB，RTX 4090 (24 GB) 绰绰有余 |
 | 指令跟随 | Instruct 版已做 RLHF，对 GRPO 进一步对齐更友好 |
+
+---
 
 ## 目录结构
 
 ```
 CodeGuide-LLM/
-├── data/
-│   ├── raw/            # 原始题目数据（LeetCode JSON / Codeforces CF）
-│   ├── processed/      # 清洗后的 prompt-response pair
-│   └── distilled/      # GPT-4o 蒸馏生成的步进式讲解数据
-├── models/
-│   ├── checkpoints/    # 训练中间 checkpoint
-│   └── final/          # 合并 LoRA 后的完整模型
-├── src/
-│   ├── data/           # 数据处理、蒸馏、格式化
-│   ├── training/       # GRPO 训练主逻辑
-│   ├── reward/         # 奖励函数实现
-│   └── inference/      # 推理与 demo
-├── scripts/
-│   ├── prepare_data.sh
-│   ├── run_distill.sh
-│   └── run_train.sh
 ├── configs/
-│   └── train_config.yaml
+│   └── train_config.yaml        # 全量训练配置（含 curriculum / normalize_rewards 等）
+├── data/
+│   └── sft_train.jsonl          # GPT-4o 蒸馏数据（ChatML 格式）
 ├── evals/
-│   ├── benchmarks/     # 评测集
-│   └── results/        # 评测结果
-├── notebooks/          # 探索性实验
-├── requirements.txt
-└── README.md
+│   ├── blind_eval.py            # 双盲评测流水线（4 phase）
+│   ├── ablation.py              # 控制变量 Ablation 实验
+│   ├── benchmarks/              # 评测集
+│   └── results/                 # 评测报告输出
+├── models/
+│   ├── sft_adapter/             # SFT LoRA adapter
+│   ├── grpo_final/              # GRPO 最终 adapter
+│   ├── grpo_best/               # 验证集 Pass@1 最优 checkpoint（自动保存）
+│   └── codeguide_llm_merged/    # 合并后完整模型（推理用）
+├── scripts/
+│   ├── build_sft_dataset.py     # 异步并发蒸馏 + 质量过滤
+│   ├── train_sft.py             # SFT 训练入口
+│   ├── inference_demo.py        # CLI 推理 Demo
+│   └── gradio_demo.py           # Web UI
+├── src/
+│   ├── data/
+│   │   ├── loader.py            # 题库加载（code_contests / TACO）
+│   │   ├── code_validator.py    # 代码提取 + 沙箱执行
+│   │   └── quality.py          # DataQualityChecker（蒸馏质量过滤）
+│   ├── reward/
+│   │   ├── format.py            # FormatComplianceReward（内容感知，防 hacking）
+│   │   ├── correctness.py       # CodeCorrectnessReward（含 AST 静态分析）
+│   │   ├── teaching.py          # LocalTeachingReward + API 版（可配置切换）
+│   │   └── composite.py        # 三路复合奖励
+│   ├── reward_functions.py      # accuracy_reward / format_reward（GRPO 接口）
+│   └── training/
+│       └── grpo_train.py        # GRPO 训练主入口（含 Curriculum / Best Ckpt）
+└── tests/
+    ├── test_rewards.py           # 三路 reward 单元测试
+    └── test_teaching_alignment.py # Local vs API Teaching Reward Spearman 对齐验证
 ```
+
+---
+
+## 奖励函数设计
+
+### 三路奖励（GRPO 训练使用）
+
+| 奖励信号 | 权重 | 实现方式 | 关键改进 |
+|---------|------|---------|---------|
+| 代码正确性（Accuracy） | 0.6 | 本地沙箱执行 + stdin/stdout 比对 | 无测试用例时改为 AST 静态分析（原版直接给 1.0 导致 hacking） |
+| 格式规范性（Format） | 0.4 | 正则 + 内容感知评分 | 步骤标题必须有 ≥50 字符实质内容 + Jaccard 去重，防止空洞结构得满分 |
+| 教学质量（Teaching） | 监控 | LocalTeachingReward（4 维度启发式） | 替换 GPT-4o-mini API（2-5s → <1ms，离散 10 档 → 连续分） |
+
+### Batch 内 Z-score 归一化
+
+三路 reward 方差各异，直接加权会导致高方差路径隐式主导梯度。启用 `normalize_rewards: true` 后，每个 batch 内对 combined reward 做归一化，使梯度贡献与 alpha 配置真正对齐：
+
+```python
+rewards_normalized = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+```
+
+### Generation Collapse 检测
+
+GRPO 每个 prompt 采样 `num_generations=4` 条 completion。若 4 条趋同，组内 reward 方差趋零，梯度消失但 loss 不报警。训练器实时监控：
+
+- `train/generation_reward_var`：组内方差均值
+- `train/collapse_ratio`：方差 < 0.01 的 prompt 占比
+- 连续 20 步 collapse_ratio > 0.5 自动 WARNING
+
+---
+
+## 训练特性
+
+### Curriculum Learning（课程学习）
+
+在 `configs/train_config.yaml` 中启用 `curriculum.enabled: true`，按难度分阶段训练：
+
+```
+阶段 1（easy）   → 建立基础能力，max_new_tokens=512
+阶段 2（medium） → 中等难度泛化，max_new_tokens=768
+阶段 3（hard）   → 挑战难题，max_new_tokens=1024
+```
+
+设计动机：GRPO 早期直接遇到 hard 题时 Pass@1≈0，reward≈0，梯度完全消失。
+
+### 最优 Checkpoint 选择
+
+启用 `save_best: true` 后，`BestCheckpointCallback` 每 `eval_steps` 步在验证集（有测试用例的题目）上计算 Pass@1，Pass@1 超越历史最高时自动保存到 `models/grpo_best/`。
+
+设计动机：GRPO 后期 training reward 虚高（reward overfit），实际 Pass@1 在下降；按最后一个 epoch 保存等于随机选 checkpoint。
+
+---
 
 ## 快速复现
 
 ### 1. 环境安装
 
 ```bash
-# 推荐 Python 3.11 + CUDA 12.1
+# Python 3.11 + CUDA 12.1
 conda create -n codeguide python=3.11 -y
 conda activate codeguide
-
 pip install -r requirements.txt
 ```
 
-> unsloth 需要与 CUDA 版本匹配，详见 [unsloth 安装指南](https://github.com/unslothai/unsloth)
+> unsloth 需与 CUDA 版本匹配，详见 [unsloth 安装指南](https://github.com/unslothai/unsloth)
 
-### 2. 数据准备
+### 2. 数据蒸馏
 
 ```bash
-# 下载并清洗原始题目
-bash scripts/prepare_data.sh
-
-# 调用 GPT-4o 生成步进式讲解（需配置 OPENAI_API_KEY）
 export OPENAI_API_KEY=sk-...
-bash scripts/run_distill.sh
+
+# 异步并发蒸馏（含质量过滤，建议 quality_threshold=0.6）
+python scripts/build_sft_dataset.py \
+    --max_items 10000 \
+    --concurrency 10 \
+    --quality_threshold 0.6 \
+    --out data/sft_train.jsonl
 ```
 
-### 3. GRPO 训练
+质量过滤会丢弃无代码块、步骤截断、内容过短的样本（约过滤 15-20%）。
+
+### 3. SFT 监督微调（可选热启动）
 
 ```bash
-bash scripts/run_train.sh
-# 或直接：
+python scripts/train_sft.py --config configs/train_config.yaml
+```
+
+### 4. GRPO 强化学习训练
+
+```bash
+# 标准训练
+python src/training/grpo_train.py --config configs/train_config.yaml
+
+# 启用 Curriculum Learning
+# 在 configs/train_config.yaml 中设置 curriculum.enabled: true，然后：
 python src/training/grpo_train.py --config configs/train_config.yaml
 ```
 
-### 4. 推理 Demo
+训练过程中 WandB 记录（需 `wandb login`）：
+
+| 指标 | 含义 |
+|------|------|
+| `reward/accuracy` | 代码正确性均值 |
+| `reward/format` | 格式规范性均值 |
+| `reward/teaching` | 教学质量均值 |
+| `reward/total` | 加权总分（原始，未归一化） |
+| `train/generation_reward_var` | 组内 reward 方差（collapse 检测） |
+| `train/collapse_ratio` | 坍缩 prompt 占比 |
+| `eval/pass1` | 验证集 Pass@1（save_best 模式） |
+| `train/curriculum_stage` | 当前课程阶段（curriculum 模式） |
+
+### 5. 推理 Demo
 
 ```bash
-python src/inference/chat.py --model models/final/codeguide-7b
+# CLI
+python scripts/inference_demo.py --model models/codeguide_llm_merged/
+
+# Web UI
+python scripts/gradio_demo.py --model models/codeguide_llm_merged/
 ```
 
-## 数据格式
+---
 
-蒸馏数据的标准格式（存储为 JSONL）：
+## 评测流水线
+
+### 双盲评测（`evals/blind_eval.py`）
+
+```bash
+# 一键运行完整评测（约 2-4 小时）
+export OPENAI_API_KEY=sk-...
+python evals/blind_eval.py --phase all
+
+# 仅重跑报告
+python evals/blind_eval.py --phase report
+```
+
+评测包含 3 个维度（GPT-4o 盲测，temperature=0）：
+
+| 维度 | 说明 |
+|------|------|
+| 讲解易懂性（Clarity） | 语言是否清晰、举例是否有助理解 |
+| 思路连贯性（Coherence） | 推导逻辑是否前后一致 |
+| 初学者友好度（Beginner-Friendly） | 是否使用生活化比喻、避免过专业术语 |
+
+报告包含 95% Bootstrap 置信区间和配对 Bootstrap 显著性检验（p<0.05）。
+
+### Ablation 实验（`evals/ablation.py`）
+
+```bash
+# 离线运行，无需 GPU，约 2 分钟
+python evals/ablation.py --n 50 --out evals/ablation_report.md
+```
+
+对 4 种配置（baseline / +format_fix / +acc_fix / +local_teaching）打分，量化每个改动的独立增益。
+
+### Teaching Reward 对齐验证（`tests/test_teaching_alignment.py`）
+
+```bash
+# 仅本地版（无需 API key）
+python tests/test_teaching_alignment.py --local_only
+
+# 完整对齐分析（需 OPENAI_API_KEY，约 200 × 2s）
+export OPENAI_API_KEY=sk-...
+python tests/test_teaching_alignment.py --n 200
+```
+
+计算 LocalTeachingReward 与 GPT-4o-mini 评分的 Spearman ρ（目标 ρ > 0.6）。
+
+---
+
+## 数据格式（ChatML）
 
 ```json
 {
-  "problem": "给定一个整数数组，找出其中第 k 大的元素...",
-  "difficulty": "medium",
-  "tags": ["heap", "quickselect"],
-  "teaching_steps": [
-    "**第一步：理解题意**\n我们要找第 k 大，注意是排序后第 k 个...",
-    "**第二步：分析暴力解**\n最直接的做法是排序，时间复杂度 O(n log n)...",
-    "**第三步：思考优化**\n能否不全排序？注意到只需要前 k 大...",
-    "**第四步：选择数据结构**\n维护一个大小为 k 的最小堆..."
+  "id": "code_contests_12345",
+  "messages": [
+    {"role": "system",    "content": "你是 CodeGuide，一位专为 OI/ACM 初学者设计的算法教学助手…"},
+    {"role": "user",      "content": "请按上述格式讲解以下算法题：\n【题目描述】…"},
+    {"role": "assistant", "content": "**第一步：理解题意**\n…\n```python\n…\n```"}
   ],
-  "final_code": "import heapq\ndef findKthLargest(nums, k):\n    return heapq.nlargest(k, nums)[-1]"
+  "metadata": {
+    "source": "code_contests",
+    "difficulty": "medium",
+    "tags": ["heap", "sorting"],
+    "pass_rate": 0.823
+  }
 }
 ```
 
-## 奖励函数设计
-
-| 奖励信号 | 权重 | 实现方式 |
-|---------|------|---------|
-| 步骤完整性 | 0.4 | GPT-4o / Qwen2.5-72B 作为 Judge，检查是否覆盖"分析→思路→代码"三阶段 |
-| 代码正确性 | 0.4 | 提取 code block 在本地执行测试用例，pass 率作为奖励 |
-| 格式规范性 | 0.2 | 正则检查 Markdown 格式、步骤标题、代码块等 |
-
-## 评测指标
-
-- **教学质量**：LLM-as-Judge（1-10 分），评估讲解清晰度、递进性、适合初学者程度
-- **代码正确性**：Pass@1 / Pass@5（在 LeetCode 样例上）
-- **步骤覆盖率**：自动检测"题意分析 / 思路推导 / 复杂度分析 / 代码实现"四阶段的出现率
-
-## 快速开始
-
-> 前提：已完成训练并生成合并模型 `models/codeguide_llm_merged/`（见"快速复现"章节）。
-> 若只想体验 Demo，可替换为任意兼容 Qwen2.5-Coder-7B-Instruct 的模型路径。
-
-### 1. 安装依赖
-
-```bash
-# 推荐 Python 3.11 + CUDA 12.1
-conda create -n codeguide python=3.11 -y
-conda activate codeguide
-
-pip install -r requirements.txt
-pip install gradio>=4.0            # Web UI 额外依赖
-```
-
-> **注意**：`unsloth` 需与 CUDA 版本匹配，详见 [unsloth 安装指南](https://github.com/unslothai/unsloth)
-
 ---
 
-### 2. 命令行交互 Demo
+## 关键设计决策（面试叙事）
 
-```bash
-python scripts/inference_demo.py --model models/codeguide_llm_merged/
-```
-
-**可选参数：**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--model` | `models/codeguide_llm_merged` | 模型路径 |
-| `--no_4bit` | — | 禁用 4bit 量化（需约 14 GB VRAM） |
-| `--max_new_tokens` | `1024` | 最大生成长度 |
-| `--temperature` | `0.7` | 采样温度 |
-
-**示例输出：**
-
-```
-你：给定一个整数数组，找出其中和为 target 的两个整数下标
-
-CodeGuide：
-
-**第一步：理解题意**
-我们需要在数组中找到两个数，使得它们的和恰好等于 target，
-并返回这两个数的下标。举例：
-  nums = [2, 7, 11, 15]，target = 9
-  → 因为 nums[0] + nums[1] = 2 + 7 = 9，返回 [0, 1]
-
-**第二步：分析暴力解法**
-最直接的做法是双重循环枚举所有下标对 (i, j)：
-  for i in range(n):
-      for j in range(i+1, n):
-          if nums[i] + nums[j] == target: return [i, j]
-时间复杂度 O(n²)，当 n 很大时会超时。
-
-**第三步：寻找优化方向**
-注意：当我们遍历到 nums[i] 时，
-只需要快速查找数组中是否存在 target - nums[i]。
-这正是哈希表的强项！
-
-**第四步：哈希表解法**
-用字典记录"已见过的数 → 其下标"：
-  seen = {}
-  for i, num in enumerate(nums):
-      complement = target - num
-      if complement in seen:
-          return [seen[complement], i]
-      seen[num] = i
-时间 O(n)，空间 O(n)。
-
-**第五步：完整 Python 实现**
-
-\`\`\`python
-def twoSum(nums: list[int], target: int) -> list[int]:
-    seen = {}          # 存储 {值: 下标}
-    for i, num in enumerate(nums):
-        complement = target - num      # 需要找的另一个数
-        if complement in seen:
-            return [seen[complement], i]   # 找到，返回两个下标
-        seen[num] = i  # 还没找到，记录当前数
-    return []          # 题目保证有解，不会走到这里
-
-# 验证
-print(twoSum([2, 7, 11, 15], 9))   # [0, 1]
-print(twoSum([3, 2, 4], 6))         # [1, 2]
-\`\`\`
-
-**复杂度分析**
-- 时间复杂度：O(n)，只需遍历一次数组
-- 空间复杂度：O(n)，哈希表最多存 n 个元素
-```
-
-**内置命令：**
-- `/clear` — 重置对话历史，开始新话题
-- `/exit`  — 退出程序
-- `/help`  — 显示帮助信息
-
----
-
-### 3. Gradio Web UI
-
-```bash
-python scripts/gradio_demo.py
-# 默认在 http://localhost:7860 打开
-```
-
-**可选参数：**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--model` | `models/codeguide_llm_merged` | 模型路径 |
-| `--port` | `7860` | 监听端口 |
-| `--share` | — | 生成 Gradio 公开分享链接 |
-| `--no_4bit` | — | 禁用 4bit 量化 |
-
-**界面布局：**
-
-```
-┌─────────────────────┬─────────────────────────────────────┐
-│  📝 题目描述（左侧）  │  💡 教学步骤——流式输出（右侧）          │
-│                     │                                     │
-│  [输入框]            │  ┌─ 对话历史 ────────────────────┐  │
-│                     │  │  你：题目描述…                  │  │
-│  [▶ 开始讲解] [清空]  │  │  CodeGuide：第一步：理解题意…  │  │
-│                     │  │  （实时流式更新）               │  │
-│  示例题目快捷按钮:    │  └───────────────────────────────┘  │
-│  两数之和 | 接雨水…  │                                     │
-│                     │  ⚙️ 生成参数（可折叠展开）             │
-└─────────────────────┴─────────────────────────────────────┘
-```
-
-**显存占用参考（RTX 4090）：**
-
-| 模式 | 显存占用 | 启动命令 |
-|------|---------|---------|
-| 4bit NF4（默认） | ~5-6 GB | `python scripts/gradio_demo.py` |
-| bf16 全精度 | ~14 GB | `python scripts/gradio_demo.py --no_4bit` |
+| 问题 | 现象 | 解决方案 |
+|------|------|---------|
+| Format Reward Hacking | 模型学会写空洞步骤标题，reward 高但内容空洞（Goodhart's Law） | 步骤内容长度约束（≥50字符）+ Jaccard 去重 |
+| Accuracy Reward 退化 | 40% TACO 样本无测试用例，全给 1.0 → 模型绕过代码正确性检测 | 无测试时改为 AST 静态分析估分 |
+| Teaching Reward 瓶颈 | GPT-4o-mini 每 step 调用耗时 8-20s；10 档离散分梯度稀疏 | LocalTeachingReward：<1ms，连续分 [0,1] |
+| 梯度方差不对齐 | 三路 reward 方差各异，高方差路径隐式主导梯度，alpha 权重失效 | Batch 内 Z-score 归一化 |
+| Generation Collapse | 4 条 completion 趋同，组内 reward 方差→0，梯度消失但 loss 正常 | WandB 实时监控 collapse_ratio，连续超阈值预警 |
+| Reward Overfit | GRPO 后期 training reward 虚高，实际 Pass@1 下降 | BestCheckpointCallback：验证集 Pass@1 选优 |
+| 早期梯度消失 | 直接遇到 hard 题 Pass@1≈0，reward≈0，无法学习 | Curriculum Learning：easy→medium→hard |
+| 评测置信度不足 | 100 题无 CI，无法判断改进是否统计显著 | Bootstrap 95% CI + 配对显著性检验 |
 
 ---
 
 ## 参考资料
 
 - [GRPO: Group Relative Policy Optimization](https://arxiv.org/abs/2402.03300)
+- [DeepSeek-R1: 用 RL 激发推理能力](https://arxiv.org/abs/2501.12948)
 - [Unsloth 官方文档](https://github.com/unslothai/unsloth)
 - [TRL GRPOTrainer](https://huggingface.co/docs/trl/grpo_trainer)
 - [Qwen2.5-Coder 技术报告](https://arxiv.org/abs/2409.12186)
-- [DeepSeek-R1: 用 RL 激发推理能力](https://arxiv.org/abs/2501.12948)
-# CodeGuide-LLM

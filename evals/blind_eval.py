@@ -44,7 +44,7 @@ import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from statistics import mean
+from statistics import mean, stdev
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -264,8 +264,13 @@ _JUDGE_SYSTEM = (
 
 _JUDGE_USER_TMPL = textwrap.dedent("""\
 你是一位严格的算法教学评委。以下是两个助手对同一道题的讲解回答，
-请从【讲解易懂性】和【思路连贯性】两个维度各打 1-5 分，
-并选出整体更优的一个（A 或 B），给出理由。
+请从以下三个维度各打 1-5 分，并选出整体更优的一个（A 或 B），给出理由。
+
+【评分维度说明】
+- 讲解易懂性（clarity）：语言是否清晰、表达是否准确、例子是否有助理解
+- 思路连贯性（coherence）：从问题到解法的推导是否流畅、逻辑是否前后一致
+- 初学者友好度（beginner_friendly）：是否使用生活化比喻、是否避免过专业术语、
+  是否步步铺垫让零基础读者也能跟上（1分=完全看不懂，5分=零基础也能理解）
 
 题目：
 {problem}
@@ -279,6 +284,7 @@ _JUDGE_USER_TMPL = textwrap.dedent("""\
 请严格按如下 JSON 格式返回，不要输出其他内容：
 {{"clarity_1": <int 1-5>, "clarity_2": <int 1-5>,
  "coherence_1": <int 1-5>, "coherence_2": <int 1-5>,
+ "beginner_friendly_1": <int 1-5>, "beginner_friendly_2": <int 1-5>,
  "winner": "<A 或 B>", "reason": "<简短评价，100字以内>"}}\
 """)
 
@@ -362,16 +368,18 @@ async def _judge_one(
                     codeguide_won = (display_winner == "A")
 
                 return {
-                    "id":                    problem_id,
-                    "flip":                  flip,
-                    "clarity_codeguide":     parsed["clarity_2"] if flip else parsed["clarity_1"],
-                    "clarity_baseline":      parsed["clarity_1"] if flip else parsed["clarity_2"],
-                    "coherence_codeguide":   parsed["coherence_2"] if flip else parsed["coherence_1"],
-                    "coherence_baseline":    parsed["coherence_1"] if flip else parsed["coherence_2"],
-                    "judge_display_winner":  display_winner,
-                    "codeguide_won":         codeguide_won,
-                    "reason":                parsed.get("reason", ""),
-                    "raw_judge":             raw,
+                    "id":                         problem_id,
+                    "flip":                       flip,
+                    "clarity_codeguide":          parsed["clarity_2"] if flip else parsed["clarity_1"],
+                    "clarity_baseline":           parsed["clarity_1"] if flip else parsed["clarity_2"],
+                    "coherence_codeguide":        parsed["coherence_2"] if flip else parsed["coherence_1"],
+                    "coherence_baseline":         parsed["coherence_1"] if flip else parsed["coherence_2"],
+                    "beginner_friendly_codeguide": parsed.get("beginner_friendly_2" if flip else "beginner_friendly_1", 3),
+                    "beginner_friendly_baseline":  parsed.get("beginner_friendly_1" if flip else "beginner_friendly_2", 3),
+                    "judge_display_winner":       display_winner,
+                    "codeguide_won":              codeguide_won,
+                    "reason":                     parsed.get("reason", ""),
+                    "raw_judge":                  raw,
                 }
             except Exception as e:
                 import asyncio as _asyncio
@@ -455,10 +463,12 @@ class EvalStats:
     baseline_wins:       int   = 0
     ties:                int   = 0           # 分数相等时视为平局
 
-    clarity_codeguide:   list  = field(default_factory=list)
-    clarity_baseline:    list  = field(default_factory=list)
-    coherence_codeguide: list  = field(default_factory=list)
-    coherence_baseline:  list  = field(default_factory=list)
+    clarity_codeguide:            list  = field(default_factory=list)
+    clarity_baseline:             list  = field(default_factory=list)
+    coherence_codeguide:          list  = field(default_factory=list)
+    coherence_baseline:           list  = field(default_factory=list)
+    beginner_friendly_codeguide:  list  = field(default_factory=list)
+    beginner_friendly_baseline:   list  = field(default_factory=list)
 
     # Pass@1（只统计有 public_tests 的题目）
     pass1_codeguide:     list  = field(default_factory=list)  # float per problem
@@ -492,6 +502,14 @@ class EvalStats:
         return mean(self.coherence_baseline) if self.coherence_baseline else 0.0
 
     @property
+    def avg_beginner_cg(self) -> float:
+        return mean(self.beginner_friendly_codeguide) if self.beginner_friendly_codeguide else 0.0
+
+    @property
+    def avg_beginner_bl(self) -> float:
+        return mean(self.beginner_friendly_baseline) if self.beginner_friendly_baseline else 0.0
+
+    @property
     def pass1_cg(self) -> float | str:
         return mean(self.pass1_codeguide) if self.pass1_codeguide else "N/A"
 
@@ -521,6 +539,106 @@ def _compute_pass1(resp_map: dict[str, str], problems: list[dict]) -> dict[str, 
     return results
 
 
+def _bootstrap_ci(
+    data: list[float],
+    n_bootstrap: int = 2000,
+    ci: float = 0.95,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """
+    非参数 Bootstrap 置信区间（均值统计量）。
+
+    返回 (lower, upper) 构成的双侧 CI。
+
+    设计选择：
+    - 使用百分位法（percentile bootstrap），无正态假设
+    - n_bootstrap=2000 在 100 条样本下标准误 < 0.001
+    - 固定 seed 保证报告可复现
+
+    用法：
+        lower, upper = _bootstrap_ci(scores, ci=0.95)
+        print(f"{mean(scores):.3f} [{lower:.3f}, {upper:.3f}]")
+    """
+    import random as _random
+
+    if not data:
+        return (0.0, 0.0)
+    rng = _random.Random(seed)
+    n = len(data)
+    boot_means = []
+    for _ in range(n_bootstrap):
+        sample = [rng.choice(data) for _ in range(n)]
+        boot_means.append(mean(sample))
+
+    boot_means.sort()
+    alpha = 1.0 - ci
+    lo_idx = int(alpha / 2 * n_bootstrap)
+    hi_idx = int((1 - alpha / 2) * n_bootstrap) - 1
+    return (round(boot_means[lo_idx], 4), round(boot_means[hi_idx], 4))
+
+
+def _bootstrap_win_rate_ci(
+    wins: list[int],     # 1=codeguide won, 0=baseline won
+    n_bootstrap: int = 2000,
+    ci: float = 0.95,
+    seed: int = 42,
+) -> tuple[float, float]:
+    """Win-rate 的 bootstrap 置信区间（比例统计量）。"""
+    import random as _random
+
+    if not wins:
+        return (0.0, 0.0)
+    rng = _random.Random(seed)
+    n = len(wins)
+    boot_rates = []
+    for _ in range(n_bootstrap):
+        sample = [rng.choice(wins) for _ in range(n)]
+        boot_rates.append(sum(sample) / n)
+
+    boot_rates.sort()
+    alpha = 1.0 - ci
+    lo_idx = int(alpha / 2 * n_bootstrap)
+    hi_idx = int((1 - alpha / 2) * n_bootstrap) - 1
+    return (round(boot_rates[lo_idx], 4), round(boot_rates[hi_idx], 4))
+
+
+def _significance_test(
+    cg_scores: list[float],
+    bl_scores: list[float],
+    n_bootstrap: int = 2000,
+    seed: int = 42,
+) -> tuple[float, bool]:
+    """
+    配对 Bootstrap 显著性检验（双侧，H0: mean(cg) == mean(bl)）。
+
+    返回 (p_value, is_significant_at_05)。
+
+    方法：Paired bootstrap permutation 风格
+    - 计算观测差值 delta = mean(cg) - mean(bl)
+    - Bootstrap 抽样重估零分布
+    - p_value = fraction of bootstraps where |boot_delta| >= |delta|
+    """
+    import random as _random
+
+    if not cg_scores or not bl_scores or len(cg_scores) != len(bl_scores):
+        return (1.0, False)
+
+    rng = _random.Random(seed)
+    n = len(cg_scores)
+    obs_delta = mean(cg_scores) - mean(bl_scores)
+
+    # 在 H0 下，配对差值以零为中心 → 随机翻转符号
+    diffs = [c - b for c, b in zip(cg_scores, bl_scores)]
+    extreme = 0
+    for _ in range(n_bootstrap):
+        boot_delta = mean([rng.choice([-1, 1]) * d for d in diffs])
+        if abs(boot_delta) >= abs(obs_delta):
+            extreme += 1
+
+    p_value = extreme / n_bootstrap
+    return (round(p_value, 4), p_value < 0.05)
+
+
 def _ascii_bar(value: float, width: int = 20, char: str = "█") -> str:
     filled = round(value * width)
     return char * filled + "░" * (width - filled)
@@ -546,6 +664,7 @@ def generate_report() -> None:
 
     # ── 聚合统计 ──────────────────────────────────────────────
     stats = EvalStats()
+    win_indicators: list[int] = []  # 1=codeguide won, 0=baseline won（用于 win-rate CI）
     for row in judge_rows:
         stats.total += 1
         won = row["codeguide_won"]
@@ -555,19 +674,30 @@ def generate_report() -> None:
         bl_sum = row["clarity_baseline"]   + row["coherence_baseline"]
         if cg_sum > bl_sum:
             stats.codeguide_wins += 1
+            win_indicators.append(1)
         elif cg_sum < bl_sum:
             stats.baseline_wins += 1
+            win_indicators.append(0)
         else:
             # 分数相同时以 judge_winner 决定
             if won:
                 stats.codeguide_wins += 1
+                win_indicators.append(1)
             else:
                 stats.baseline_wins += 1
+                win_indicators.append(0)
 
         stats.clarity_codeguide.append(row["clarity_codeguide"])
         stats.clarity_baseline.append(row["clarity_baseline"])
         stats.coherence_codeguide.append(row["coherence_codeguide"])
         stats.coherence_baseline.append(row["coherence_baseline"])
+        # beginner_friendly（兼容旧格式：字段缺失时默认 3 分）
+        stats.beginner_friendly_codeguide.append(
+            row.get("beginner_friendly_codeguide", 3)
+        )
+        stats.beginner_friendly_baseline.append(
+            row.get("beginner_friendly_baseline", 3)
+        )
 
         pid = row["id"]
         if pid in pass1_cg:
@@ -602,6 +732,24 @@ def generate_report() -> None:
             if row["codeguide_won"]:
                 by_diff[diff]["wins"] += 1
 
+    # ── Bootstrap 置信区间计算 ────────────────────────────────
+    logger.info("计算 Bootstrap 95%% 置信区间…")
+    wr_lo, wr_hi = _bootstrap_win_rate_ci(win_indicators)
+    cl_cg_lo, cl_cg_hi = _bootstrap_ci(stats.clarity_codeguide)
+    cl_bl_lo, cl_bl_hi = _bootstrap_ci(stats.clarity_baseline)
+    co_cg_lo, co_cg_hi = _bootstrap_ci(stats.coherence_codeguide)
+    co_bl_lo, co_bl_hi = _bootstrap_ci(stats.coherence_baseline)
+    bg_cg_lo, bg_cg_hi = _bootstrap_ci(stats.beginner_friendly_codeguide)
+    bg_bl_lo, bg_bl_hi = _bootstrap_ci(stats.beginner_friendly_baseline)
+
+    # ── 配对显著性检验 ────────────────────────────────────────
+    cl_pval,  cl_sig  = _significance_test(stats.clarity_codeguide,           stats.clarity_baseline)
+    co_pval,  co_sig  = _significance_test(stats.coherence_codeguide,         stats.coherence_baseline)
+    bg_pval,  bg_sig  = _significance_test(stats.beginner_friendly_codeguide, stats.beginner_friendly_baseline)
+
+    def _sig_mark(is_sig: bool) -> str:
+        return "✅ p<0.05（显著）" if is_sig else "❌ p≥0.05（不显著）"
+
     # ── 报告渲染 ──────────────────────────────────────────────
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -619,14 +767,15 @@ def generate_report() -> None:
 
 ## 一、汇总结果
 
-| 指标 | CodeGuide-LLM | Qwen2.5-Coder-7B（基座） |
-|:-----|:---:|:---:|
-| **Win-rate** | **{stats.win_rate:.1%}** | {1 - stats.win_rate:.1%} |
-| 平均讲解易懂性（1-5） | **{stats.avg_clarity_cg:.2f}** | {stats.avg_clarity_bl:.2f} |
-| 平均思路连贯性（1-5） | **{stats.avg_coherence_cg:.2f}** | {stats.avg_coherence_bl:.2f} |
-| Pass@1（代码正确性） | {p1_cg_str} | {p1_bl_str} |
-| 评审题目总数 | {stats.total} | — |
-| Pass@1 参与题目数 | {stats.pass1_n} | — |
+| 指标 | CodeGuide-LLM | 95% CI | Qwen2.5-Coder-7B（基座） | 95% CI |
+|:-----|:---:|:---:|:---:|:---:|
+| **Win-rate** | **{stats.win_rate:.1%}** | [{wr_lo:.1%}, {wr_hi:.1%}] | {1 - stats.win_rate:.1%} | — |
+| 讲解易懂性（1-5） | **{stats.avg_clarity_cg:.2f}** | [{cl_cg_lo:.2f}, {cl_cg_hi:.2f}] | {stats.avg_clarity_bl:.2f} | [{cl_bl_lo:.2f}, {cl_bl_hi:.2f}] |
+| 思路连贯性（1-5） | **{stats.avg_coherence_cg:.2f}** | [{co_cg_lo:.2f}, {co_cg_hi:.2f}] | {stats.avg_coherence_bl:.2f} | [{co_bl_lo:.2f}, {co_bl_hi:.2f}] |
+| 初学者友好度（1-5） | **{stats.avg_beginner_cg:.2f}** | [{bg_cg_lo:.2f}, {bg_cg_hi:.2f}] | {stats.avg_beginner_bl:.2f} | [{bg_bl_lo:.2f}, {bg_bl_hi:.2f}] |
+| Pass@1（代码正确性） | {p1_cg_str} | — | {p1_bl_str} | — |
+| 评审题目总数 | {stats.total} | — | — | — |
+| Pass@1 参与题目数 | {stats.pass1_n} | — | — | — |
 
 ### Win-rate 可视化
 
@@ -651,15 +800,24 @@ Baseline     {_ascii_bar(1-stats.win_rate)} {1-stats.win_rate:.1%}  ({stats.base
 ### 讲解易懂性（Clarity）
 
 ```
-CodeGuide  均值 {stats.avg_clarity_cg:.2f}  {_ascii_bar(stats.avg_clarity_cg / 5)}
-Baseline   均值 {stats.avg_clarity_bl:.2f}  {_ascii_bar(stats.avg_clarity_bl / 5)}
+CodeGuide  均值 {stats.avg_clarity_cg:.2f}  {_ascii_bar(stats.avg_clarity_cg / 5)}  95% CI [{cl_cg_lo:.2f}, {cl_cg_hi:.2f}]
+Baseline   均值 {stats.avg_clarity_bl:.2f}  {_ascii_bar(stats.avg_clarity_bl / 5)}  95% CI [{cl_bl_lo:.2f}, {cl_bl_hi:.2f}]
 ```
 
 ### 思路连贯性（Coherence）
 
 ```
-CodeGuide  均值 {stats.avg_coherence_cg:.2f}  {_ascii_bar(stats.avg_coherence_cg / 5)}
-Baseline   均值 {stats.avg_coherence_bl:.2f}  {_ascii_bar(stats.avg_coherence_bl / 5)}
+CodeGuide  均值 {stats.avg_coherence_cg:.2f}  {_ascii_bar(stats.avg_coherence_cg / 5)}  95% CI [{co_cg_lo:.2f}, {co_cg_hi:.2f}]
+Baseline   均值 {stats.avg_coherence_bl:.2f}  {_ascii_bar(stats.avg_coherence_bl / 5)}  95% CI [{co_bl_lo:.2f}, {co_bl_hi:.2f}]
+```
+
+### 初学者友好度（Beginner-Friendly）
+
+> 新增维度：评估讲解是否使用生活化比喻、避免过专业术语、步步铺垫让零基础读者跟上。
+
+```
+CodeGuide  均值 {stats.avg_beginner_cg:.2f}  {_ascii_bar(stats.avg_beginner_cg / 5)}  95% CI [{bg_cg_lo:.2f}, {bg_cg_hi:.2f}]
+Baseline   均值 {stats.avg_beginner_bl:.2f}  {_ascii_bar(stats.avg_beginner_bl / 5)}  95% CI [{bg_bl_lo:.2f}, {bg_bl_hi:.2f}]
 ```
 
 ---
@@ -687,7 +845,25 @@ Baseline   均值 {stats.avg_coherence_bl:.2f}  {_ascii_bar(stats.avg_coherence_
 
 ---
 
-## 六、评测方法说明
+## 六、📊 统计显著性检验
+
+> 使用配对 Bootstrap 显著性检验（n_bootstrap=2000，双侧，H0: 两模型均值相同）。
+> p < 0.05 表示差异在 95% 置信水平下统计显著。
+
+| 评分维度 | CodeGuide 均值 | Baseline 均值 | 差值 | p-value | 是否显著 |
+|:--------|:---:|:---:|:---:|:---:|:---:|
+| 讲解易懂性（Clarity） | {stats.avg_clarity_cg:.3f} | {stats.avg_clarity_bl:.3f} | {stats.avg_clarity_cg - stats.avg_clarity_bl:+.3f} | {cl_pval:.4f} | {_sig_mark(cl_sig)} |
+| 思路连贯性（Coherence） | {stats.avg_coherence_cg:.3f} | {stats.avg_coherence_bl:.3f} | {stats.avg_coherence_cg - stats.avg_coherence_bl:+.3f} | {co_pval:.4f} | {_sig_mark(co_sig)} |
+| 初学者友好度（Beginner） | {stats.avg_beginner_cg:.3f} | {stats.avg_beginner_bl:.3f} | {stats.avg_beginner_cg - stats.avg_beginner_bl:+.3f} | {bg_pval:.4f} | {_sig_mark(bg_sig)} |
+
+**综合结论**：
+- {"CodeGuide-LLM 在 Clarity 上显著优于基座（p<0.05）" if cl_sig else "Clarity 差异不显著（p≥0.05）"}
+- {"CodeGuide-LLM 在 Coherence 上显著优于基座（p<0.05）" if co_sig else "Coherence 差异不显著（p≥0.05）"}
+- {"CodeGuide-LLM 在初学者友好度上显著优于基座（p<0.05）" if bg_sig else "初学者友好度差异不显著（p≥0.05）"}
+
+---
+
+## 七、评测方法说明
 
 1. **双盲设计**：对每道题，随机决定哪个模型的回答作为"回答A"展示，
    GPT-4o 裁判不知道两个回答的来源，消除位置偏差。
@@ -695,11 +871,18 @@ Baseline   均值 {stats.avg_coherence_bl:.2f}  {_ascii_bar(stats.avg_coherence_
 2. **解码策略**：两个模型均使用 Greedy decoding（temperature=0），
    保证评测结果可复现。
 
-3. **奖励信号对比**：
-   - 教学质量：GPT-4o 盲测打分（Clarity + Coherence）
-   - 代码正确性：本地沙箱执行 + stdin/stdout 比对
+3. **评分维度**（v2 新增初学者友好度）：
+   - 讲解易懂性（Clarity）：语言清晰度与举例质量
+   - 思路连贯性（Coherence）：推导逻辑前后一致性
+   - 初学者友好度（Beginner-Friendly）：是否用生活化比喻、避免专业术语
+   - 代码正确性（Pass@1）：本地沙箱执行 + stdin/stdout 比对
 
-4. **测试集说明**：100 道题均从验证集/未见过的题目中采样，
+4. **置信区间**：使用非参数百分位 Bootstrap 法（n=2000），无正态假设。
+
+5. **显著性检验**：使用配对 Bootstrap 检验（双侧），不假设任何分布形式，
+   鲁棒性高于配对 t 检验。
+
+6. **测试集说明**：100 道题均从验证集/未见过的题目中采样，
    已通过 ID 排重确保与训练集无重叠。
 """
 
@@ -708,10 +891,15 @@ Baseline   均值 {stats.avg_coherence_bl:.2f}  {_ascii_bar(stats.avg_coherence_
 
     # 终端摘要
     logger.info(
-        "\n  Win-rate: %.1f%%  |  Clarity: %.2f vs %.2f  |  Coherence: %.2f vs %.2f  |  Pass@1: %s vs %s",
-        stats.win_rate * 100,
-        stats.avg_clarity_cg, stats.avg_clarity_bl,
-        stats.avg_coherence_cg, stats.avg_coherence_bl,
+        "\n  Win-rate: %.1f%% [%.1f%%, %.1f%%]"
+        "  |  Clarity: %.2f vs %.2f (p=%.4f%s)"
+        "  |  Coherence: %.2f vs %.2f (p=%.4f%s)"
+        "  |  Beginner: %.2f vs %.2f (p=%.4f%s)"
+        "  |  Pass@1: %s vs %s",
+        stats.win_rate * 100, wr_lo * 100, wr_hi * 100,
+        stats.avg_clarity_cg, stats.avg_clarity_bl, cl_pval, " *" if cl_sig else "",
+        stats.avg_coherence_cg, stats.avg_coherence_bl, co_pval, " *" if co_sig else "",
+        stats.avg_beginner_cg, stats.avg_beginner_bl, bg_pval, " *" if bg_sig else "",
         p1_cg_str, p1_bl_str,
     )
 
